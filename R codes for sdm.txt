@@ -1,0 +1,199 @@
+#load raw data
+mydata_bm<-read.csv('stlucia_obs.csv')
+str(mydata_bm)
+
+# remove erroneous coordinates, where either the latitude or
+# longitude is missing
+Data_nullbm <- subset(mydata_bm, (!is.na(latitude)) & (!is.na(longitude)))  #  '!' means the opposite logic value
+cat(nrow(mydata_bm) - nrow(Data_nullbm), "records are removed")
+
+# remove duplicated data based on latitude and longitude
+dup_bm <- duplicated(Data_nullbm[c("latitude", "longitude")])
+data_unique_bm <- Data_nullbm[!dup_bm, ]
+cat(nrow(Data_nullbm) - nrow(data_unique_bm), "records are removed")
+
+#add a new row with 1 to indicate presence
+data_unique_bm$Presence<-'1'
+#select only presence, latitude and longitude columns
+Data_new_bm<-select(data_unique_bm, Presence, latitude, longitude)
+write.csv(Data_new_bm, 'cleanData.csv')
+
+#convert to spatial dataframe
+coordinates(Data_new_bm)<-~longitude+latitude
+
+
+
+#subset to training and test set(70/30)
+smp_size_bm<- floor(0.7 *nrow(Data_new_bm))
+train.data.bm<- sample(seq_len(nrow(Data_new_bm)), size = smp_size_bm)
+Train_data_bm<-Data_new_bm[train.data.bm,]
+Test_data_bm<-Data_new_bm[-train.data.bm,]
+write.csv(Test_data_bm, 'TestData.csv')
+write.csv(Train_data_bm, 'TrainData.csv')
+
+#load tct sentinel developed in GEE
+SentinelTCT<-stack('Sentinel_TCT_STLucia.tif')
+#import canopy height data
+CanopyLucia<-raster('Canopyheight.tif')
+
+#separate the files into individual bands
+Brightness<- SentinelTCT[[1]]
+Greenness<- SentinelTCT[[2]]
+Wetness<- SentinelTCT[[3]]
+
+#resample canopy height raster
+CanopyLucia1<-resample(CanopyLucia, Bright)
+
+#export rasters
+writeRaster(CanopyLucia1, 'Resample_canopy.tif')
+writeRaster(Brightness, 'Brightness1.tif')
+writeRaster(Greenness, 'Greenness1.tif')
+writeRaster(Wetness, 'Wetness1.tif')
+
+#stack all rasters to be used for prediction
+Variables<-stack(CanopyLucia1, Greenness, Brightness, Wetness)
+
+
+
+#extract values from raster to training data
+presvals_bm <- extract(Variables, Train_data_bm)
+#generate random points(absence) and extract raster values to points
+backgr_bm <- randomPoints(Variables, 1500)
+absvals_bm <- extract(Variables, backgr_bm)
+#merge the presence ad absence dataframes
+pb_bm <- c(rep(1, nrow(presvals_bm)), rep(0, nrow(absvals_bm)))
+sdmdata_bm <- data.frame(cbind(pb_bm, rbind(presvals_bm, absvals_bm)))
+head(sdmdata_bm)
+summary(sdmdata_bm)
+pairs(sdmdata_bm[,2:5], cex=0.1, fig=TRUE) 
+
+
+#set seeed so as make sure that we get the same results for randomization
+set.seed(0)
+group_bm <- kfold(Train_data_bm, 5)
+pres_train_bm <- Train_data_bm[group_bm != 1, ]
+pres_test_bm <- Train_data_bm[group_bm == 1, ]
+
+set.seed(10)
+backg_bm<- randomPoints(Variables[[1]], n=1700, extf = 1.25)
+colnames(backg_bm) = c('lon', 'lat')
+group_bm <- kfold(backg_bm, 5)
+backg_train_bm <- backg_bm[group_bm != 1, ]
+backg_test_bm <- backg_bm[group_bm == 1, ]
+
+#remove null values
+sdmdata_bmclean <- sdmdata_bm[complete.cases(sdmdata_bm),]
+# Check for correlation
+correlation = cor(sdmdata_bmclean[, c("brightness", "greenness", "wetness",
+                                 "Lucia_Canopyheight")], sdmdata_bmclean[, "pb_bm"])
+
+
+
+install.packages('corrplot')
+library(corrplot)
+
+#check correlation between variables
+corrplot (cor(sdmdata_bmclean[,c("brightness", "greenness", "wetness",
+                         "Lucia_Canopyheight")]),
+         method = "number",
+         #type = "upper" # show only upper side
+)
+
+
+
+library(devtools)
+devtools::install_git("https://gitup.uni-potsdam.de/macroecology/mecofun.git", force = TRUE)
+library(mecofun)
+# Names of our variables:
+pred <- c('brightness', 'greenness', 'wetness', 'Lucia_Canopyheight')
+
+#plot response curves
+install.packages('spatialRF')
+par(mfrow=c(1,4)) 
+plot_response_curves(model = RF_bm)
+response(RF_bm,predictors=pred,data=sdmdata_bmclean)#, cex.lab=1.5, col="black")
+
+
+#Modelling
+library(randomForest)
+model_bm <- pb_bm ~ brightness + greenness + wetness + Lucia_Canopyheight 
+RF_bm <- randomForest(model_bm, data=sdmdata_bmclean, na.action=na.roughfix)
+print(RF_bm)
+importance(RF_bm)
+varImpPlot(RF_bm)
+
+#generate dataframes for testing
+testpres_bm <- data.frame( extract(Variables, pres_test_bm))
+testbackg_bm <- data.frame( extract(Variables, backg_test_bm) )
+
+#outline accuracy results
+erf_bm <- evaluate(testpres_bm, testbackg_bm, RF_bm)
+erf_bm
+
+threshold(erf_bm)
+plot(erf_bm, 'ROC')
+par(mfrow=c(1, 1))
+density(erf_bm)
+boxplot(erf_bm, col=c('blue', 'red'))
+
+#map prediction
+pr_bm <- predict(Variables, RF_bm)
+writeRaster(pr_bm, 'RandomForest.tif')
+plot(pr_bm, main='Random Forest regression for Butterfly and Moth')
+
+#generate random points for all study areas
+#Generate rando points from protected, nonprotected 
+#and agroforested area
+nonfrstpts<-randomPoints(protKK, n=100)
+nonfrstpts11<-data.frame(raster::extract(Kk_CS, nonfrstpts))
+
+#reproduce the code and combine all dataframes
+#combine all data frames
+wholedatanew1<-rbind(
+nonfrstdataonly11,
+agrodataonly11,
+Alldataonly11,
+noncbsdmfi1,
+agrocbsdmfi12,
+frstcbsdmfi11)
+
+#compute summary statistics by groups
+library(dplyr)
+group_by(wholedatanew1, Group) %>%
+  summarise(
+    #count = n(),
+    #mean = mean(RasterVals, na.rm = TRUE),
+    sd = sd(RasterVals, na.rm = TRUE),
+    median = median(RasterVals, na.rm = TRUE),
+    IQR = IQR(RasterVals, na.rm = TRUE),
+    Q1 = quantile(RasterVals,0.25, na.rm=TRUE),
+    Q3 = quantile(RasterVals,0.75, na.rm=TRUE))
+
+
+#plot mean plots to show different classes
+library(ggpubr)
+ggboxplot(wholedatanew1, x = "Group", y = "RasterVals",
+          color = "Group", palette = c('#000000','#000000','#000000', 
+                                       '#000000','#000000'),
+          add = c("mean_se", "jitter"),
+          order = c('NP_KK',
+                    AF_KK',
+                    'P_KK',
+                    'SBNP_KK',
+                    'SBAF_KK',
+                    'SBP_KK',
+                    'NP_SA',
+                    'P_SA',
+                    'DFNP_SA',
+                    'DFP_SA'),
+          ylab = "Insect biodiversity status(0-1)", xlab = "")
+
+
+#perform kruskas wallis test
+#data is a non normal distribution
+kruskal.test(RasterVals ~ Group, data = (wholedatanew1)
+
+#Perform post hoc test to identify classes that 
+#have significant differences
+pairwise.wilcox.test((wholedatanew1$RasterVals, (wholedatanew1$Group,
+                     p.adjust.method = "BH")
